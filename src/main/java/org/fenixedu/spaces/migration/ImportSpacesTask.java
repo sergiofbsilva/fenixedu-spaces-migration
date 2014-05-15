@@ -4,6 +4,10 @@ import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.math.BigDecimal;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -11,6 +15,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+
+import net.sourceforge.fenixedu.util.ConnectionManager;
 
 import org.fenixedu.bennu.core.domain.Bennu;
 import org.fenixedu.bennu.core.domain.groups.PersistentGroup;
@@ -470,9 +476,9 @@ public class ImportSpacesTask extends CustomTask {
         final List<SpaceBean> fromJson = gson.fromJson(new JsonReader(new FileReader(file)), new TypeToken<List<SpaceBean>>() {
         }.getType());
 
-        for (SpaceBean spaceBean : fromJson) {
-            idToBeansMap.put(spaceBean.externalId, spaceBean);
-        }
+//        for (SpaceBean spaceBean : fromJson) {
+//            idToBeansMap.put(spaceBean.externalId, spaceBean);
+//        }
 
         final List<List<SpaceBean>> partitions = Lists.partition(fromJson, 1000);
         taskLog("Processing chunks of 1000, total : %d\n", partitions.size());
@@ -500,10 +506,11 @@ public class ImportSpacesTask extends CustomTask {
         if (spaceBean == null) {
             return null;
         }
-        if (!beanToSpaceMap.containsKey(spaceBean)) {
-            beanToSpaceMap.put(spaceBean, create(process(idToBeansMap.get(spaceBean.parentExternalId)), spaceBean));
-        }
-        return beanToSpaceMap.get(spaceBean);
+        return update((Space) FenixFramework.getDomainObject(getNewSpaceId(spaceBean.externalId)), spaceBean);
+//        if (!beanToSpaceMap.containsKey(spaceBean)) {
+//            beanToSpaceMap.put(spaceBean, create(process(idToBeansMap.get(spaceBean.parentExternalId)), spaceBean));
+//        }
+//        return beanToSpaceMap.get(spaceBean);
     }
 
     private Space create(final Space parent, final SpaceBean spaceBean) {
@@ -515,6 +522,90 @@ public class ImportSpacesTask extends CustomTask {
             }
 
         });
+    }
+
+    private String getNewSpaceId(String externalId) {
+        final long oid = Long.parseLong(externalId);
+        final int idInternal = (int) (oid & 0x0000FFFF);
+        final long cid = getSpaceCID() << 32;
+        return Long.toString(cid + (idInternal >> 32));
+    }
+
+    private static Long spaceCid;
+
+    private Long getSpaceCID() {
+        if (spaceCid == null) {
+            spaceCid = initCID();
+        }
+        return spaceCid;
+    }
+
+    private static Long initCID() {
+        Connection connection = ConnectionManager.getCurrentSQLConnection();
+        Statement statement = null;
+        try {
+            statement = connection.createStatement();
+            String query =
+                    String.format("select DOMAIN_CLASS_ID from FF$DOMAIN_CLASS_INFO where DOMAIN_CLASS_NAME = '%s'",
+                            Space.class.getName());
+
+            ResultSet rs = statement.executeQuery(query);
+            while (rs.next()) {
+                return rs.getLong("DOMAIN_CLASS_ID");
+            }
+            return null;
+        } catch (SQLException e) {
+            throw new Error(e);
+        } finally {
+            try {
+                if (statement != null) {
+                    statement.close();
+                }
+            } catch (SQLException e) {
+                throw new Error(e);
+            }
+        }
+    }
+
+    private Space update(Space space, SpaceBean spaceBean) {
+        for (InformationBean infoBean : spaceBean.beans()) {
+            infoBean.getMetadata().put("examCapacity", spaceBean.examCapacity == null ? null : spaceBean.examCapacity.toString());
+//            infoBean.getMetadata().put("normalCapacity",
+//                    spaceBean.normalCapacity == null ? null : spaceBean.normalCapacity.toString());
+            if (spaceBean.normalCapacity != null) {
+                infoBean.setAllocatableCapacity(spaceBean.normalCapacity);
+            }
+            space.bean(infoBean);
+        }
+        final PersistentGroup occupationGroup = FenixFramework.getDomainObject(spaceBean.occupationGroup);
+        final PersistentGroup lessonOccupationsAccessGroup =
+                FenixFramework.getDomainObject(spaceBean.lessonOccupationsAccessGroup);
+        final PersistentGroup writtenEvaluationOccupationsAccessGroup =
+                FenixFramework.getDomainObject(spaceBean.writtenEvaluationOccupationsAccessGroup);
+        final PersistentGroup managementGroup = FenixFramework.getDomainObject(spaceBean.managementSpaceGroup);
+
+        Group group = NobodyGroup.get();
+
+        if (occupationGroup != null) {
+            group = group.or(occupationGroup.toGroup());
+        }
+
+        if (lessonOccupationsAccessGroup != null) {
+            group = group.or(lessonOccupationsAccessGroup.toGroup());
+        }
+
+        if (writtenEvaluationOccupationsAccessGroup != null) {
+            group = group.or(writtenEvaluationOccupationsAccessGroup.toGroup());
+        }
+
+        space.setOccupationsAccessGroup(group.equals(NobodyGroup.get()) ? null : group);
+
+        if (FenixFramework.isDomainObjectValid(managementGroup)) {
+            space.setManagementAccessGroup(managementGroup.toGroup());
+        } else {
+            space.setManagementAccessGroup((Group) null);
+        }
+        return space;
     }
 
     private Space innerCreate(Space parent, SpaceBean spaceBean) {
